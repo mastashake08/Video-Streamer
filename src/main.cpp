@@ -2,8 +2,10 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
-#include <SD_MMC.h>
+#include <I2S.h>
 #include <FS.h>
+#include <SD.h>
+#include <SPI.h>
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <Preferences.h>
@@ -11,7 +13,6 @@
 // #include <Adafruit_GFX.h>
 // #include <Adafruit_SSD1306.h>
 #include "esp_camera.h"
-#include "driver/i2s.h"
 #include "esp_sleep.h"
 
 // ============================================
@@ -82,10 +83,8 @@ enum SystemState {
 };
 SystemState currentState = STATE_INIT;
 
-// SD Card pins for XIAO ESP32S3
-#define SD_MMC_CLK  7   // D8
-#define SD_MMC_CMD  9   // D10 (MOSI)
-#define SD_MMC_D0   8   // D9 (MISO)
+// SD Card configuration for XIAO ESP32S3 (SPI mode)
+#define SD_CS_PIN 21     // Chip Select pin
 
 // // OLED Display configuration (DISABLED - defective display)
 // #define SCREEN_WIDTH 128
@@ -101,13 +100,14 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/audio");
 
 // Audio configuration for PDM microphone (per Seeed documentation)
-#define I2S_PORT I2S_NUM_0
 #define PDM_DATA_PIN 41  // GPIO 41: PDM Microphone DATA
 #define PDM_CLK_PIN 42   // GPIO 42: PDM Microphone CLK
-#define SAMPLE_RATE 16000
+#define SAMPLE_RATE 16000U
 #define SAMPLE_BITS 16
-#define BUFFER_SIZE 512
+#define WAV_HEADER_SIZE 44
 #define VOLUME_GAIN 2
+#define RECORD_TIME 10  // seconds per file
+#define WAV_FILE_NAME "recording"
 
 // Camera pin configuration for XIAO ESP32S3 Sense
 camera_config_t camera_config = {
@@ -260,8 +260,8 @@ String getDateString() {
 void cleanupOldFiles() {
   Serial.println("Running file cleanup...");
   
-  uint64_t totalSpace = SD_MMC.totalBytes() / (1024 * 1024);
-  uint64_t usedSpace = SD_MMC.usedBytes() / (1024 * 1024);
+  uint64_t totalSpace = SD.totalBytes() / (1024 * 1024);
+  uint64_t usedSpace = SD.usedBytes() / (1024 * 1024);
   uint64_t freeSpace = totalSpace - usedSpace;
   
   Serial.printf("SD Card: %lluMB free / %lluMB total\n", freeSpace, totalSpace);
@@ -274,7 +274,7 @@ void cleanupOldFiles() {
   Serial.println("Low disk space! Deleting old files...");
   
   // Delete oldest files from video directory
-  File videoDir = SD_MMC.open("/video");
+  File videoDir = SD.open("/video");
   if (videoDir && videoDir.isDirectory()) {
     File file = videoDir.openNextFile();
     int deletedCount = 0;
@@ -285,7 +285,7 @@ void cleanupOldFiles() {
         size_t fileSize = file.size();
         file.close();
         
-        if (SD_MMC.remove(filename.c_str())) {
+        if (SD.remove(filename.c_str())) {
           deletedCount++;
           freeSpace += (fileSize / (1024 * 1024));
           Serial.printf("Deleted: %s\n", filename.c_str());
@@ -299,7 +299,7 @@ void cleanupOldFiles() {
   videoDir.close();
   
   // Update free space
-  freeSpace = (SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024 * 1024);
+  freeSpace = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
   Serial.printf("Free space after cleanup: %lluMB\n", freeSpace);
 }
 
@@ -332,7 +332,7 @@ void enterDeepSleep(uint64_t sleepTimeSeconds) {
   Serial.printf("Entering deep sleep for %llu seconds\n", sleepTimeSeconds);
   
   // Close all files
-  SD_MMC.end();
+  SD.end();
   
   // Configure wakeup
   esp_sleep_enable_timer_wakeup(sleepTimeSeconds * 1000000ULL);
@@ -423,38 +423,14 @@ void initOTA() {
   Serial.println("  Use Arduino IDE or platformio to upload firmware wirelessly");
 }
 
-// Initialize PDM microphone (based on Seeed documentation)
+// Initialize PDM microphone (using I2S library per Seeed example)
 bool initMicrophone() {
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // PDM_MONO_MODE
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-  };
-
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_PIN_NO_CHANGE,
-    .ws_io_num = PDM_CLK_PIN,  // GPIO 42
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = PDM_DATA_PIN  // GPIO 41
-  };
-
-  esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("I2S driver install failed: %d\n", err);
-    return false;
-  }
-
-  err = i2s_set_pin(I2S_PORT, &pin_config);
-  if (err != ESP_OK) {
-    Serial.printf("I2S pin config failed: %d\n", err);
+  // Configure pins: bck=-1, ws=42 (CLK), data_in=41 (DATA), data_out=-1, mck=-1
+  I2S.setAllPins(-1, PDM_CLK_PIN, PDM_DATA_PIN, -1, -1);
+  
+  // Begin in PDM mono mode with 16kHz sample rate and 16-bit samples
+  if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
+    Serial.println("Failed to initialize I2S!");
     return false;
   }
 
@@ -462,18 +438,17 @@ bool initMicrophone() {
   return true;
 }
 
-// Initialize SD Card
+// Initialize SD Card (using SPI mode per Seeed example)
 bool initSDCard() {
   Serial.println("Initializing SD Card...");
   
-  // Use 1-bit mode for SD_MMC (only 3 pins needed)
-  // Mount point, mode1bit, format_if_mount_failed, max_files
-  if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
-    Serial.println("SD Card Mount Failed");
+  // Initialize SD card in SPI mode with CS pin 21
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD Card Mount Failed!");
     return false;
   }
   
-  uint8_t cardType = SD_MMC.cardType();
+  uint8_t cardType = SD.cardType();
   if (cardType == CARD_NONE) {
     Serial.println("No SD Card attached");
     return false;
@@ -490,9 +465,9 @@ bool initSDCard() {
     Serial.println("UNKNOWN");
   }
   
-  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-  uint64_t usedSpace = SD_MMC.usedBytes() / (1024 * 1024);
-  uint64_t totalSpace = SD_MMC.totalBytes() / (1024 * 1024);
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t usedSpace = SD.usedBytes() / (1024 * 1024);
+  uint64_t totalSpace = SD.totalBytes() / (1024 * 1024);
   uint64_t freeSpace = totalSpace - usedSpace;
   
   Serial.printf("SD Card Size: %lluMB\n", cardSize);
@@ -501,15 +476,15 @@ bool initSDCard() {
   Serial.printf("Free Space: %lluMB\n", freeSpace);
   
   // Create directories for recording
-  if (!SD_MMC.exists("/video")) {
-    if (SD_MMC.mkdir("/video")) {
+  if (!SD.exists("/video")) {
+    if (SD.mkdir("/video")) {
       Serial.println("Created /video directory");
     } else {
       Serial.println("Failed to create /video directory");
     }
   }
-  if (!SD_MMC.exists("/audio")) {
-    if (SD_MMC.mkdir("/audio")) {
+  if (!SD.exists("/audio")) {
+    if (SD.mkdir("/audio")) {
       Serial.println("Created /audio directory");
     } else {
       Serial.println("Failed to create /audio directory");
@@ -533,7 +508,7 @@ bool saveFrameToSD(camera_fb_t *fb) {
     sprintf(filename, "/video/frame_%06lu.jpg", frameCount++);
   }
   
-  File file = SD_MMC.open(filename, FILE_WRITE);
+  File file = SD.open(filename, FILE_WRITE);
   if (!file) {
     Serial.println("Failed to open file for writing");
     currentState = STATE_ERROR;
@@ -555,93 +530,95 @@ bool saveFrameToSD(camera_fb_t *fb) {
   return true;
 }
 
-// Generate WAV file header (per Seeed documentation format)
-void generateWavHeader(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
-  uint32_t file_size = wav_size + 36;
+// Generate WAV file header (per Seeed example)
+void generate_wav_header(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
+  // See this for reference: http://soundfile.sapp.org/doc/WaveFormat/
+  uint32_t file_size = wav_size + WAV_HEADER_SIZE - 8;
   uint32_t byte_rate = sample_rate * SAMPLE_BITS / 8;
-  
-  // Build header manually to avoid narrowing warnings
-  wav_header[0] = 'R'; wav_header[1] = 'I'; wav_header[2] = 'F'; wav_header[3] = 'F';
-  wav_header[4] = file_size & 0xFF; wav_header[5] = (file_size >> 8) & 0xFF;
-  wav_header[6] = (file_size >> 16) & 0xFF; wav_header[7] = (file_size >> 24) & 0xFF;
-  wav_header[8] = 'W'; wav_header[9] = 'A'; wav_header[10] = 'V'; wav_header[11] = 'E';
-  wav_header[12] = 'f'; wav_header[13] = 'm'; wav_header[14] = 't'; wav_header[15] = ' ';
-  wav_header[16] = 0x10; wav_header[17] = 0x00; wav_header[18] = 0x00; wav_header[19] = 0x00;
-  wav_header[20] = 0x01; wav_header[21] = 0x00;
-  wav_header[22] = 0x01; wav_header[23] = 0x00;
-  wav_header[24] = sample_rate & 0xFF; wav_header[25] = (sample_rate >> 8) & 0xFF;
-  wav_header[26] = (sample_rate >> 16) & 0xFF; wav_header[27] = (sample_rate >> 24) & 0xFF;
-  wav_header[28] = byte_rate & 0xFF; wav_header[29] = (byte_rate >> 8) & 0xFF;
-  wav_header[30] = (byte_rate >> 16) & 0xFF; wav_header[31] = (byte_rate >> 24) & 0xFF;
-  wav_header[32] = 0x02; wav_header[33] = 0x00;
-  wav_header[34] = 0x10; wav_header[35] = 0x00;
-  wav_header[36] = 'd'; wav_header[37] = 'a'; wav_header[38] = 't'; wav_header[39] = 'a';
-  wav_header[40] = wav_size & 0xFF; wav_header[41] = (wav_size >> 8) & 0xFF;
-  wav_header[42] = (wav_size >> 16) & 0xFF; wav_header[43] = (wav_size >> 24) & 0xFF;
+  const uint8_t set_wav_header[] = {
+    'R', 'I', 'F', 'F', // ChunkID
+    file_size, file_size >> 8, file_size >> 16, file_size >> 24, // ChunkSize
+    'W', 'A', 'V', 'E', // Format
+    'f', 'm', 't', ' ', // Subchunk1ID
+    0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
+    0x01, 0x00, // AudioFormat (1 for PCM)
+    0x01, 0x00, // NumChannels (1 channel)
+    sample_rate, sample_rate >> 8, sample_rate >> 16, sample_rate >> 24, // SampleRate
+    byte_rate, byte_rate >> 8, byte_rate >> 16, byte_rate >> 24, // ByteRate
+    0x02, 0x00, // BlockAlign
+    0x10, 0x00, // BitsPerSample (16 bits)
+    'd', 'a', 't', 'a', // Subchunk2ID
+    wav_size, wav_size >> 8, wav_size >> 16, wav_size >> 24, // Subchunk2Size
+  };
+  memcpy(wav_header, set_wav_header, sizeof(set_wav_header));
 }
 
-// Save audio buffer to SD card with timestamp (based on Seeed recording example)
-bool saveAudioToSD(int16_t *audioBuffer, size_t length) {
-  static File audioFile;
-  static uint32_t audioDataSize = 0;
-  static unsigned long lastFileTime = 0;
+// Record WAV file (based on Seeed example)
+void record_wav() {
+  uint32_t sample_size = 0;
+  uint32_t record_size = (SAMPLE_RATE * SAMPLE_BITS / 8) * RECORD_TIME;
+  uint8_t *rec_buffer = NULL;
   
-  // Create new audio file every 10 seconds
-  if (!audioFile || (millis() - lastFileTime > 10000)) {
-    if (audioFile) {
-      // Update WAV header with actual data size
-      audioFile.seek(0);
-      uint8_t wav_header[44];
-      generateWavHeader(wav_header, audioDataSize, SAMPLE_RATE);
-      audioFile.write(wav_header, 44);
-      audioFile.close();
-      Serial.printf("Closed audio file %lu (%u bytes)\n", audioFileCount, audioDataSize);
-    }
-    
-    // Use timestamp in filename if available
-    char filename[64];
-    if (timeInitialized) {
-      String timestamp = getTimestamp();
-      sprintf(filename, "/audio/%s_audio_%06lu.wav", timestamp.c_str(), audioFileCount++);
-    } else {
-      sprintf(filename, "/audio/audio_%06lu.wav", audioFileCount++);
-    }
-    
-    audioFile = SD_MMC.open(filename, FILE_WRITE);
-    
-    if (!audioFile) {
-      Serial.println("Failed to create audio file");
-      currentState = STATE_ERROR;
-      return false;
-    }
-    
-    // Write placeholder WAV header (will be updated on close)
-    uint8_t wav_header[44];
-    generateWavHeader(wav_header, 0, SAMPLE_RATE);
-    audioFile.write(wav_header, 44);
-    audioDataSize = 0;
-    lastFileTime = millis();
-    Serial.printf("Created new audio file: %s\n", filename);
+  Serial.printf("Ready to start recording %d seconds...\n", RECORD_TIME);
+  
+  // Use timestamp in filename if available
+  char filename[64];
+  if (timeInitialized) {
+    String timestamp = getTimestamp();
+    sprintf(filename, "/%s_%s_%06lu.wav", WAV_FILE_NAME, timestamp.c_str(), audioFileCount++);
+  } else {
+    sprintf(filename, "/%s_%06lu.wav", WAV_FILE_NAME, audioFileCount++);
   }
   
-  // Apply volume gain (per Seeed documentation)
-  for (size_t i = 0; i < length; i++) {
-    audioBuffer[i] <<= VOLUME_GAIN;
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return;
   }
   
-  // Write audio data
-  size_t bytesWritten = audioFile.write((const uint8_t*)audioBuffer, length * 2);
-  audioDataSize += bytesWritten;
+  // Write the header to the WAV file
+  uint8_t wav_header[WAV_HEADER_SIZE];
+  generate_wav_header(wav_header, record_size, SAMPLE_RATE);
+  file.write(wav_header, WAV_HEADER_SIZE);
   
-  return bytesWritten == (length * 2);
+  // PSRAM malloc for recording
+  rec_buffer = (uint8_t *)ps_malloc(record_size);
+  if (rec_buffer == NULL) {
+    Serial.printf("malloc failed!\n");
+    file.close();
+    return;
+  }
+  Serial.printf("Buffer: %d bytes\n", ESP.getPsramSize() - ESP.getFreePsram());
+  
+  // Start recording - read from I2S
+  sample_size = I2S.read(rec_buffer, record_size);
+  
+  if (sample_size == 0) {
+    Serial.printf("Record Failed!\n");
+  } else {
+    Serial.printf("Record %d bytes\n", sample_size);
+  }
+  
+  // Increase volume
+  for (uint32_t i = 0; i < sample_size; i += SAMPLE_BITS/8) {
+    (*(uint16_t *)(rec_buffer+i)) <<= VOLUME_GAIN;
+  }
+  
+  // Write data to the WAV file
+  Serial.printf("Writing to the file ...\n");
+  if (file.write(rec_buffer, record_size) != record_size)
+    Serial.printf("Write file Failed!\n");
+  
+  free(rec_buffer);
+  file.close();
+  Serial.printf("Recording saved: %s\n", filename);
 }
 
-// Recording task for SD card mode with motion detection
+// Recording task for SD card mode with motion detection and auto-recording
 void recordingTask(void *parameter) {
-  Serial.println("Starting SD card recording with motion detection...");
+  Serial.println("Starting continuous SD card recording...");
+  Serial.println("Recording audio files automatically every 10 seconds");
   
-  int16_t audioBuffer[BUFFER_SIZE];
-  size_t bytesRead = 0;
   unsigned long lastFrameTime = 0;
   unsigned long lastMotionCheck = 0;
   const unsigned long frameInterval = 100; // Capture frame every 100ms (10 FPS)
@@ -699,15 +676,13 @@ void recordingTask(void *parameter) {
       Serial.println("⏸️  No motion - recording paused");
     }
     
-    // Continuously record audio only when motion detected
-    if (isRecording) {
-      esp_err_t result = i2s_read(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytesRead, portMAX_DELAY);
-      if (result == ESP_OK && bytesRead > 0) {
-        saveAudioToSD(audioBuffer, bytesRead / 2);
-      }
-    }
+    // Auto-record audio continuously (10 second clips)
+    Serial.println("🎙️  Recording audio clip...");
+    record_wav();
+    lastActivityTime = millis();
     
-    vTaskDelay(1);
+    // Small delay between recordings
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
   
   Serial.println("Recording stopped");
@@ -774,16 +749,16 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 
 // Audio streaming task
 void audioTask(void *parameter) {
-  int16_t audioBuffer[BUFFER_SIZE];
-  size_t bytesRead = 0;
+  const size_t bufferSize = 512;
+  uint8_t audioBuffer[bufferSize];
   
   while (true) {
     // Read audio data from I2S/PDM microphone
-    esp_err_t result = i2s_read(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytesRead, portMAX_DELAY);
+    size_t bytesRead = I2S.read(audioBuffer, bufferSize);
     
-    if (result == ESP_OK && bytesRead > 0 && ws.count() > 0) {
+    if (bytesRead > 0 && ws.count() > 0) {
       // Send audio data to all connected WebSocket clients
-      ws.binaryAll((uint8_t*)audioBuffer, bytesRead);
+      ws.binaryAll(audioBuffer, bytesRead);
     }
     
     vTaskDelay(1); // Small delay to prevent watchdog
@@ -1108,8 +1083,8 @@ void setup() {
       String json = "{";
       json += "\"uptime\":" + String(millis() / 1000) + ",";
       json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
-      json += "\"sdFree\":" + String((SD_MMC.totalBytes() - SD_MMC.usedBytes()) / (1024 * 1024)) + ",";
-      json += "\"sdTotal\":" + String(SD_MMC.totalBytes() / (1024 * 1024)) + ",";
+      json += "\"sdFree\":" + String((SD.totalBytes() - SD.usedBytes()) / (1024 * 1024)) + ",";
+      json += "\"sdTotal\":" + String(SD.totalBytes() / (1024 * 1024)) + ",";
       json += "\"frames\":" + String(frameCount) + ",";
       json += "\"audioFiles\":" + String(audioFileCount) + ",";
       json += "\"motionDetected\":" + String(motionDetected ? "true" : "false") + ",";
@@ -1167,8 +1142,8 @@ void loop() {
   if (recordingMode) {
     static unsigned long lastStatus = 0;
     if (millis() - lastStatus > 30000) {  // Every 30 seconds
-      uint64_t totalSpace = SD_MMC.totalBytes() / (1024 * 1024);
-      uint64_t usedSpace = SD_MMC.usedBytes() / (1024 * 1024);
+      uint64_t totalSpace = SD.totalBytes() / (1024 * 1024);
+      uint64_t usedSpace = SD.usedBytes() / (1024 * 1024);
       uint64_t freeSpace = totalSpace - usedSpace;
       
       Serial.println("========================================");

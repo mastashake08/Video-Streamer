@@ -19,6 +19,9 @@
 #include "esp_camera.h"
 #include "esp_sleep.h"
 
+// Camera sensor PID definitions
+#define OV3660_PID 0x3660
+
 // ============================================
 // WiFi Credentials - CHANGE THESE!
 // ============================================
@@ -144,37 +147,51 @@ AsyncWebSocket ws("/audio");
 #define RECORD_TIME 10  // seconds per file
 #define WAV_FILE_NAME "recording"
 
-// Camera pin configuration for XIAO ESP32S3 Sense
-camera_config_t camera_config = {
-  .pin_pwdn = -1,
-  .pin_reset = -1,
-  .pin_xclk = 10,
-  .pin_sscb_sda = 40,
-  .pin_sscb_scl = 39,
-  .pin_d7 = 48,
-  .pin_d6 = 11,
-  .pin_d5 = 12,
-  .pin_d4 = 14,
-  .pin_d3 = 16,
-  .pin_d2 = 18,
-  .pin_d1 = 17,
-  .pin_d0 = 15,
-  .pin_vsync = 38,
-  .pin_href = 47,
-  .pin_pclk = 13,
-  .xclk_freq_hz = 20000000,
-  .ledc_timer = LEDC_TIMER_0,
-  .ledc_channel = LEDC_CHANNEL_0,
-  .pixel_format = PIXFORMAT_JPEG,
-  .frame_size = FRAMESIZE_VGA,  // 640x480 (smaller, should work with PSRAM)
-  .jpeg_quality = 10,
-  .fb_count = 2,
-  .fb_location = CAMERA_FB_IN_PSRAM,
-  .grab_mode = CAMERA_GRAB_LATEST
-};
-// Initialize camera
+// Initialize camera - following official XIAO ESP32S3 example pattern
 bool initCamera() {
-  esp_err_t err = esp_camera_init(&camera_config);
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = 15;
+  config.pin_d1 = 17;
+  config.pin_d2 = 18;
+  config.pin_d3 = 16;
+  config.pin_d4 = 14;
+  config.pin_d5 = 12;
+  config.pin_d6 = 11;
+  config.pin_d7 = 48;
+  config.pin_xclk = 10;
+  config.pin_pclk = 13;
+  config.pin_vsync = 38;
+  config.pin_href = 47;
+  config.pin_sscb_sda = 40;
+  config.pin_sscb_scl = 39;
+  config.pin_pwdn = -1;
+  config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG; // for streaming
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  
+  // If PSRAM IC present, init with UXGA resolution and higher JPEG quality
+  // for larger pre-allocated frame buffer.
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      // Limit the frame size when PSRAM is not available
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  }
+
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
     currentState = STATE_ERROR;
@@ -184,11 +201,16 @@ bool initCamera() {
   // Adjust camera sensor settings
   sensor_t * s = esp_camera_sensor_get();
   if (s) {
-    s->set_brightness(s, 0);     // -2 to 2
-    s->set_contrast(s, 0);       // -2 to 2
-    s->set_saturation(s, 0);     // -2 to 2
-    s->set_hmirror(s, 0);        // 0 = disable, 1 = enable
-    s->set_vflip(s, 0);          // 0 = disable, 1 = enable
+    // Initial sensors are flipped vertically and colors are a bit saturated
+    if (s->id.PID == OV3660_PID) {
+      s->set_vflip(s, 1);        // flip it back
+      s->set_brightness(s, 1);   // up the brightness just a bit
+      s->set_saturation(s, -2);  // lower the saturation
+    }
+    // Drop down frame size for higher initial frame rate
+    if (config.pixel_format == PIXFORMAT_JPEG) {
+      s->set_framesize(s, FRAMESIZE_QVGA);
+    }
   }
   
   Serial.println("Camera initialized successfully");
@@ -972,21 +994,22 @@ void record_wav() {
 
 // Recording task for SD card mode with continuous recording
 void recordingTask(void *parameter) {
-  Serial.println("Starting continuous SD card recording...");
+  Serial.println("Starting 10-second interval recording...");
   Serial.println("========================================");
   
   // Display recording mode
   if (audioOnlyMode) {
     Serial.println("Mode: AUDIO ONLY - Recording audio files every 10 seconds");
   } else if (videoOnlyMode) {
-    Serial.println("Mode: VIDEO ONLY - Continuous video recording");
+    Serial.println("Mode: VIDEO ONLY - Recording 10-second video clips");
   } else {
-    Serial.println("Mode: AUDIO + VIDEO - Recording both automatically");
+    Serial.println("Mode: AUDIO + VIDEO - Recording 10-second clips of both");
   }
   Serial.println("========================================\n");
   
   unsigned long lastAudioTime = 0;
-  const unsigned long audioInterval = 10000; // Record audio every 10 seconds
+  unsigned long lastVideoTime = 0;
+  const unsigned long clipInterval = 10000; // Record clips every 10 seconds
   
   currentState = STATE_RECORDING;
   
@@ -1010,38 +1033,46 @@ void recordingTask(void *parameter) {
       lastCleanupTime = currentTime;
     }
     
-    // VIDEO RECORDING (only if not audio-only mode) - continuous capture like official example
-    if (!audioOnlyMode) {
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (!fb) {
-        Serial.println("❌ Error getting framebuffer!");
-        vTaskDelay(pdMS_TO_TICKS(100)); // Wait a bit before retry
-      } else {
-        bool saved = saveFrameToSD(fb);
-        esp_camera_fb_return(fb);
-        
-        if (!saved) {
-          Serial.println("⚠️  Frame save failed, continuing...");
+    // VIDEO RECORDING (only if not audio-only mode) - 10-second clips
+    if (!audioOnlyMode && (currentTime - lastVideoTime >= clipInterval)) {
+      Serial.println("📹 Recording 10-second video clip...");
+      unsigned long clipStart = millis();
+      unsigned long clipFrameCount = 0;
+      
+      // Capture frames for 10 seconds
+      while (millis() - clipStart < 10000 && recordingMode) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+          Serial.println("❌ Error getting framebuffer!");
+          vTaskDelay(pdMS_TO_TICKS(100)); // Wait a bit before retry
+        } else {
+          bool saved = saveFrameToSD(fb);
+          esp_camera_fb_return(fb);
+          
+          if (saved) {
+            clipFrameCount++;
+          } else {
+            Serial.println("⚠️  Frame save failed, continuing...");
+          }
         }
-        
-        lastActivityTime = currentTime;
+        vTaskDelay(1); // Minimal delay for watchdog
       }
+      
+      Serial.printf("✓ Video clip complete: %lu frames captured\n", clipFrameCount);
+      lastActivityTime = currentTime;
+      lastVideoTime = currentTime;
     }
     
-    // AUDIO RECORDING (only if not video-only mode, non-blocking with timer)
-    if (!videoOnlyMode && (currentTime - lastAudioTime >= audioInterval)) {
+    // AUDIO RECORDING (only if not video-only mode)
+    if (!videoOnlyMode && (currentTime - lastAudioTime >= clipInterval)) {
       Serial.println("🎙️  Recording audio clip...");
       record_wav();
       lastActivityTime = currentTime;
       lastAudioTime = currentTime;
     }
     
-    // Very small delay only if not capturing video
-    if (audioOnlyMode) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-    } else {
-      vTaskDelay(1); // Minimal delay to prevent watchdog, let camera capture as fast as possible
-    }
+    // Sleep between clips
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
   
   Serial.println("========================================");

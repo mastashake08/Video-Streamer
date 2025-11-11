@@ -167,11 +167,11 @@ camera_config_t camera_config = {
   .ledc_channel = LEDC_CHANNEL_0,
   .pixel_format = PIXFORMAT_JPEG,
   .frame_size = FRAMESIZE_SVGA,  // 800x600
-  .jpeg_quality = 12,  // 0-63, lower = higher quality
-  .fb_count = 2,
-  .grab_mode = CAMERA_GRAB_LATEST
+  .jpeg_quality = 12,
+  .fb_count = 1,
+  .fb_location = CAMERA_FB_IN_PSRAM,
+  .grab_mode = CAMERA_GRAB_WHEN_EMPTY
 };
-
 // Initialize camera
 bool initCamera() {
   esp_err_t err = esp_camera_init(&camera_config);
@@ -824,7 +824,10 @@ bool initSDCard() {
 
 // Save JPEG frame to SD card with timestamp
 bool saveFrameToSD(camera_fb_t *fb) {
-  if (!fb) return false;
+  if (!fb) {
+    Serial.println("❌ saveFrameToSD: No frame buffer provided");
+    return false;
+  }
   
   // Acquire SD mutex
   if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -832,14 +835,16 @@ bool saveFrameToSD(camera_fb_t *fb) {
     char filename[64];
     if (timeInitialized) {
       String timestamp = getTimestamp();
-      sprintf(filename, "/video/%s_frame_%06lu.jpg", timestamp.c_str(), frameCount++);
+      sprintf(filename, "/video/%s_frame_%06lu.jpg", timestamp.c_str(), frameCount);
     } else {
-      sprintf(filename, "/video/frame_%06lu.jpg", frameCount++);
+      sprintf(filename, "/video/frame_%06lu.jpg", frameCount);
     }
+    
+    Serial.printf("📹 Saving frame %lu to: %s (%d bytes)...\n", frameCount, filename, fb->len);
     
     File file = SD.open(filename, FILE_WRITE);
     if (!file) {
-      Serial.println("Failed to open file for writing");
+      Serial.printf("❌ Failed to open file for writing: %s\n", filename);
       currentState = STATE_ERROR;
       xSemaphoreGive(sdMutex);
       return false;
@@ -852,13 +857,12 @@ bool saveFrameToSD(camera_fb_t *fb) {
     xSemaphoreGive(sdMutex);
     
     if (written != fb->len) {
-      Serial.printf("Write error: wrote %d of %d bytes\n", written, fb->len);
+      Serial.printf("❌ Write error: wrote %d of %d bytes\n", written, fb->len);
       return false;
     }
     
-    if (frameCount % 30 == 0) {  // Log every 30 frames
-      Serial.printf("Saved frame %lu (%d bytes)\n", frameCount, fb->len);
-    }
+    Serial.printf("✓ Frame %lu saved successfully\n", frameCount);
+    frameCount++;
     
     return true;
   } else {
@@ -969,6 +973,7 @@ void record_wav() {
 // Recording task for SD card mode with continuous recording
 void recordingTask(void *parameter) {
   Serial.println("Starting continuous SD card recording...");
+  Serial.println("========================================");
   
   // Display recording mode
   if (audioOnlyMode) {
@@ -978,49 +983,72 @@ void recordingTask(void *parameter) {
   } else {
     Serial.println("Mode: AUDIO + VIDEO - Recording both automatically");
   }
+  Serial.println("========================================\n");
   
-  unsigned long lastFrameTime = 0;
-  const unsigned long frameInterval = 100; // Capture frame every 100ms (10 FPS)
+  unsigned long lastAudioTime = 0;
+  const unsigned long audioInterval = 10000; // Record audio every 10 seconds
   
   currentState = STATE_RECORDING;
   
   while (recordingMode) {
+    unsigned long currentTime = millis();
+    
     // Check battery status periodically
-    checkBatteryStatus();
-    if (batteryLow) {
-      Serial.println("Battery low - stopping recording");
-      break;
-    }
-    
-    // Run cleanup periodically
-    if (millis() - lastCleanupTime > CLEANUP_INTERVAL) {
-      cleanupOldFiles();
-      lastCleanupTime = millis();
-    }
-    
-    // VIDEO RECORDING (only if not audio-only mode)
-    if (!audioOnlyMode && (millis() - lastFrameTime >= frameInterval)) {
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (fb) {
-        saveFrameToSD(fb);
-        esp_camera_fb_return(fb);
-        lastActivityTime = millis();
-        lastFrameTime = millis();
+    static unsigned long lastBatteryCheck = 0;
+    if (currentTime - lastBatteryCheck > 60000) {
+      checkBatteryStatus();
+      lastBatteryCheck = currentTime;
+      if (batteryLow) {
+        Serial.println("Battery low - stopping recording");
+        break;
       }
     }
     
-    // AUDIO RECORDING (only if not video-only mode)
-    if (!videoOnlyMode) {
-      Serial.println("🎙️  Recording audio clip...");
-      record_wav();
-      lastActivityTime = millis();
+    // Run cleanup periodically
+    if (currentTime - lastCleanupTime > CLEANUP_INTERVAL) {
+      cleanupOldFiles();
+      lastCleanupTime = currentTime;
     }
     
-    // Small delay to prevent watchdog
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // VIDEO RECORDING (only if not audio-only mode) - continuous capture like official example
+    if (!audioOnlyMode) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("❌ Error getting framebuffer!");
+        vTaskDelay(pdMS_TO_TICKS(100)); // Wait a bit before retry
+      } else {
+        bool saved = saveFrameToSD(fb);
+        esp_camera_fb_return(fb);
+        
+        if (!saved) {
+          Serial.println("⚠️  Frame save failed, continuing...");
+        }
+        
+        lastActivityTime = currentTime;
+      }
+    }
+    
+    // AUDIO RECORDING (only if not video-only mode, non-blocking with timer)
+    if (!videoOnlyMode && (currentTime - lastAudioTime >= audioInterval)) {
+      Serial.println("🎙️  Recording audio clip...");
+      record_wav();
+      lastActivityTime = currentTime;
+      lastAudioTime = currentTime;
+    }
+    
+    // Very small delay only if not capturing video
+    if (audioOnlyMode) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    } else {
+      vTaskDelay(1); // Minimal delay to prevent watchdog, let camera capture as fast as possible
+    }
   }
   
+  Serial.println("========================================");
   Serial.println("Recording stopped");
+  Serial.printf("Total frames captured: %lu\n", frameCount);
+  Serial.printf("Total audio files: %lu\n", audioFileCount);
+  Serial.println("========================================");
   currentState = STATE_INIT;
   vTaskDelete(NULL);
 }

@@ -9,6 +9,10 @@
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 // #include <Wire.h>
 // #include <Adafruit_GFX.h>
 // #include <Adafruit_SSD1306.h>
@@ -22,11 +26,36 @@ const char* wifi_ssid = "MastaWifi";      // Change to your WiFi name
 const char* wifi_password = "mastashake08";  // Change to your WiFi password
 
 // ============================================
+// BLE Configuration
+// ============================================
+#define BLE_SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define BLE_CONTROL_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define BLE_STATUS_CHAR_UUID    "1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e"
+#define BLE_WIFI_CHAR_UUID      "d8de624e-140f-4a23-8b85-726f9d55da18"
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pControlCharacteristic = nullptr;
+BLECharacteristic* pStatusCharacteristic = nullptr;
+BLECharacteristic* pWiFiCharacteristic = nullptr;
+bool deviceConnected = false;
+bool bleEnabled = true;
+bool wifiRequested = false;
+
+// ============================================
 // Recording Mode Configuration
 // ============================================
-bool recordingMode = false;  // Set to true when WiFi fails
+bool recordingMode = false;  // Set to true when WiFi fails or BLE command
+bool bleRecordingActive = false;  // BLE-controlled recording state
 unsigned long frameCount = 0;
 unsigned long audioFileCount = 0;
+
+// File listing flags
+volatile bool listVideoRequested = false;
+volatile bool listAudioRequested = false;
+volatile bool listAllRequested = false;
+
+// SD Card mutex for thread-safe access
+SemaphoreHandle_t sdMutex = NULL;
 
 // ============================================
 // Motion Detection Configuration
@@ -65,7 +94,7 @@ bool batteryLow = false;
 // ============================================
 // Status LED Configuration
 // ============================================
-#define LED_BUILTIN 21            // Built-in LED pin for XIAO ESP32S3
+// LED_BUILTIN is already defined by the board variant (pin 21)
 #define LED_BLINK_RECORDING 200   // Fast blink when recording
 #define LED_BLINK_WIFI 1000       // Slow blink when WiFi connected
 #define LED_BLINK_ERROR 100       // Very fast blink on error
@@ -388,6 +417,124 @@ void updateStatusLED() {
 }
 
 // ============================================
+// FORWARD DECLARATIONS
+// ============================================
+void recordingTask(void *parameter);
+
+// ============================================
+// FILE LISTING FUNCTIONS
+// ============================================
+void listVideoFiles() {
+  Serial.println("\n========================================");
+  Serial.println("VIDEO FILES:");
+  Serial.println("========================================");
+  File videoDir = SD.open("/video");
+  if (videoDir && videoDir.isDirectory()) {
+    int count = 0;
+    File file = videoDir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        count++;
+        Serial.printf("%d. %s (%u bytes)\n", count, file.name(), file.size());
+      }
+      file = videoDir.openNextFile();
+    }
+    if (count == 0) {
+      Serial.println("No video files found.");
+    } else {
+      Serial.printf("\nTotal: %d video files\n", count);
+    }
+    videoDir.close();
+  } else {
+    Serial.println("Failed to open /video directory");
+  }
+  Serial.println("========================================\n");
+}
+
+void listAudioFiles() {
+  Serial.println("\n========================================");
+  Serial.println("AUDIO FILES:");
+  Serial.println("========================================");
+  File rootDir = SD.open("/");
+  if (rootDir && rootDir.isDirectory()) {
+    int count = 0;
+    File file = rootDir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        String filename = String(file.name());
+        if (filename.endsWith(".wav")) {
+          count++;
+          Serial.printf("%d. %s (%u bytes)\n", count, file.name(), file.size());
+        }
+      }
+      file = rootDir.openNextFile();
+    }
+    if (count == 0) {
+      Serial.println("No audio files found.");
+    } else {
+      Serial.printf("\nTotal: %d audio files\n", count);
+    }
+    rootDir.close();
+  } else {
+    Serial.println("Failed to open root directory");
+  }
+  Serial.println("========================================\n");
+}
+
+void listAllFiles() {
+  Serial.println("\n========================================");
+  Serial.println("ALL RECORDED FILES:");
+  Serial.println("========================================");
+  
+  // List video files
+  Serial.println("\nVIDEO FILES (/video):");
+  File videoDir = SD.open("/video");
+  if (videoDir && videoDir.isDirectory()) {
+    int count = 0;
+    File file = videoDir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        count++;
+        Serial.printf("  %d. %s (%u bytes)\n", count, file.name(), file.size());
+      }
+      file = videoDir.openNextFile();
+    }
+    if (count == 0) {
+      Serial.println("  No video files found.");
+    } else {
+      Serial.printf("  Subtotal: %d video files\n", count);
+    }
+    videoDir.close();
+  }
+  
+  // List audio files
+  Serial.println("\nAUDIO FILES (/):");
+  File rootDir = SD.open("/");
+  if (rootDir && rootDir.isDirectory()) {
+    int count = 0;
+    File file = rootDir.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        String filename = String(file.name());
+        if (filename.endsWith(".wav")) {
+          count++;
+          Serial.printf("  %d. %s (%u bytes)\n", count, file.name(), file.size());
+        }
+      }
+      file = rootDir.openNextFile();
+    }
+    if (count == 0) {
+      Serial.println("  No audio files found.");
+    } else {
+      Serial.printf("  Subtotal: %d audio files\n", count);
+    }
+    rootDir.close();
+  }
+  
+  Serial.println("========================================\n");
+}
+
+// ============================================
 // OTA UPDATE FUNCTIONS
 // ============================================
 void initOTA() {
@@ -421,6 +568,173 @@ void initOTA() {
   ArduinoOTA.begin();
   Serial.println("✓ OTA updates enabled");
   Serial.println("  Use Arduino IDE or platformio to upload firmware wirelessly");
+}
+
+// ============================================
+// BLE CALLBACKS & FUNCTIONS
+// ============================================
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("BLE Client Connected");
+    if (pStatusCharacteristic) {
+      String status = "Connected|Recording:" + String(bleRecordingActive ? "ON" : "OFF");
+      pStatusCharacteristic->setValue(status.c_str());
+      pStatusCharacteristic->notify();
+    }
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("BLE Client Disconnected");
+    // Restart advertising
+    BLEDevice::startAdvertising();
+  }
+};
+
+class ControlCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    
+    if (value.length() > 0) {
+      String command = String(value.c_str());
+      command.trim();
+      Serial.println("BLE Command: " + command);
+      
+      if (command == "START") {
+        if (!bleRecordingActive) {
+          bleRecordingActive = true;
+          recordingMode = true;
+          Serial.println("📹 BLE: Recording STARTED");
+          
+          if (pStatusCharacteristic) {
+            pStatusCharacteristic->setValue("Recording:ON");
+            pStatusCharacteristic->notify();
+          }
+          
+          // Start recording task
+          xTaskCreatePinnedToCore(
+            recordingTask,
+            "SDRecording",
+            8192,
+            NULL,
+            1,
+            NULL,
+            0
+          );
+        } else {
+          Serial.println("⚠️  Recording already active");
+        }
+      }
+      else if (command == "STOP") {
+        bleRecordingActive = false;
+        recordingMode = false;
+        Serial.println("⏹️  BLE: Recording STOPPED");
+        
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue("Recording:OFF");
+          pStatusCharacteristic->notify();
+        }
+      }
+      else if (command == "STATUS") {
+        String status = "Frames:" + String(frameCount) + "|Audio:" + String(audioFileCount);
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue(status.c_str());
+          pStatusCharacteristic->notify();
+        }
+      }
+      else if (command == "LIST_VIDEO") {
+        listVideoRequested = true;
+        Serial.println("📋 Video file list requested...");
+      }
+      else if (command == "LIST_AUDIO") {
+        listAudioRequested = true;
+        Serial.println("📋 Audio file list requested...");
+      }
+      else if (command == "LIST_ALL") {
+        listAllRequested = true;
+        Serial.println("📋 All files list requested...");
+      }
+    }
+  }
+};
+
+class WiFiCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    
+    if (value.length() > 0) {
+      String command = String(value.c_str());
+      command.trim();
+      Serial.println("BLE WiFi Command: " + command);
+      
+      if (command == "ENABLE_WIFI") {
+        wifiRequested = true;
+        Serial.println("📡 WiFi mode requested via BLE");
+        
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue("WiFi:Connecting...");
+          pStatusCharacteristic->notify();
+        }
+        
+        // Will be handled in loop()
+      }
+    }
+  }
+};
+
+// Initialize BLE Server
+bool initBLE() {
+  Serial.println("Initializing BLE...");
+  
+  BLEDevice::init("ESP32-CAM-BLE");
+  
+  // Create BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+  
+  // Create BLE Service
+  BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
+  
+  // Control Characteristic (Write)
+  pControlCharacteristic = pService->createCharacteristic(
+    BLE_CONTROL_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pControlCharacteristic->setCallbacks(new ControlCallbacks());
+  
+  // Status Characteristic (Read + Notify)
+  pStatusCharacteristic = pService->createCharacteristic(
+    BLE_STATUS_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pStatusCharacteristic->addDescriptor(new BLE2902());
+  pStatusCharacteristic->setValue("Ready");
+  
+  // WiFi Control Characteristic (Write)
+  pWiFiCharacteristic = pService->createCharacteristic(
+    BLE_WIFI_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pWiFiCharacteristic->setCallbacks(new WiFiCallbacks());
+  
+  // Start the service
+  pService->start();
+  
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("✓ BLE Server started");
+  Serial.println("  Device Name: ESP32-CAM-BLE");
+  Serial.println("  Commands: START, STOP, STATUS");
+  Serial.println("  WiFi: Send ENABLE_WIFI to WiFi characteristic");
+  
+  return true;
 }
 
 // Initialize PDM microphone (using I2S library per Seeed example)
@@ -492,6 +806,15 @@ bool initSDCard() {
   }
   
   Serial.println("✓ SD Card initialized");
+  
+  // Create SD card mutex for thread-safe access
+  sdMutex = xSemaphoreCreateMutex();
+  if (sdMutex == NULL) {
+    Serial.println("⚠️  Failed to create SD mutex");
+  } else {
+    Serial.println("✓ SD mutex created");
+  }
+  
   return true;
 }
 
@@ -499,35 +822,45 @@ bool initSDCard() {
 bool saveFrameToSD(camera_fb_t *fb) {
   if (!fb) return false;
   
-  // Use timestamp in filename if available
-  char filename[64];
-  if (timeInitialized) {
-    String timestamp = getTimestamp();
-    sprintf(filename, "/video/%s_frame_%06lu.jpg", timestamp.c_str(), frameCount++);
+  // Acquire SD mutex
+  if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    // Use timestamp in filename if available
+    char filename[64];
+    if (timeInitialized) {
+      String timestamp = getTimestamp();
+      sprintf(filename, "/video/%s_frame_%06lu.jpg", timestamp.c_str(), frameCount++);
+    } else {
+      sprintf(filename, "/video/frame_%06lu.jpg", frameCount++);
+    }
+    
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+      Serial.println("Failed to open file for writing");
+      currentState = STATE_ERROR;
+      xSemaphoreGive(sdMutex);
+      return false;
+    }
+    
+    size_t written = file.write(fb->buf, fb->len);
+    file.close();
+    
+    // Release SD mutex
+    xSemaphoreGive(sdMutex);
+    
+    if (written != fb->len) {
+      Serial.printf("Write error: wrote %d of %d bytes\n", written, fb->len);
+      return false;
+    }
+    
+    if (frameCount % 30 == 0) {  // Log every 30 frames
+      Serial.printf("Saved frame %lu (%d bytes)\n", frameCount, fb->len);
+    }
+    
+    return true;
   } else {
-    sprintf(filename, "/video/frame_%06lu.jpg", frameCount++);
-  }
-  
-  File file = SD.open(filename, FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open file for writing");
-    currentState = STATE_ERROR;
+    Serial.println("⚠️  Failed to acquire SD mutex for video");
     return false;
   }
-  
-  size_t written = file.write(fb->buf, fb->len);
-  file.close();
-  
-  if (written != fb->len) {
-    Serial.printf("Write error: wrote %d of %d bytes\n", written, fb->len);
-    return false;
-  }
-  
-  if (frameCount % 30 == 0) {  // Log every 30 frames
-    Serial.printf("Saved frame %lu (%d bytes)\n", frameCount, fb->len);
-  }
-  
-  return true;
 }
 
 // Generate WAV file header (per Seeed example)
@@ -561,40 +894,21 @@ void record_wav() {
   
   Serial.printf("Ready to start recording %d seconds...\n", RECORD_TIME);
   
-  // Use timestamp in filename if available
-  char filename[64];
-  if (timeInitialized) {
-    String timestamp = getTimestamp();
-    sprintf(filename, "/%s_%s_%06lu.wav", WAV_FILE_NAME, timestamp.c_str(), audioFileCount++);
-  } else {
-    sprintf(filename, "/%s_%06lu.wav", WAV_FILE_NAME, audioFileCount++);
-  }
-  
-  File file = SD.open(filename, FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-  
-  // Write the header to the WAV file
-  uint8_t wav_header[WAV_HEADER_SIZE];
-  generate_wav_header(wav_header, record_size, SAMPLE_RATE);
-  file.write(wav_header, WAV_HEADER_SIZE);
-  
   // PSRAM malloc for recording
   rec_buffer = (uint8_t *)ps_malloc(record_size);
   if (rec_buffer == NULL) {
     Serial.printf("malloc failed!\n");
-    file.close();
     return;
   }
   Serial.printf("Buffer: %d bytes\n", ESP.getPsramSize() - ESP.getFreePsram());
   
-  // Start recording - read from I2S
+  // Start recording - read from I2S (do this BEFORE acquiring SD mutex to avoid blocking)
   sample_size = I2S.read(rec_buffer, record_size);
   
   if (sample_size == 0) {
     Serial.printf("Record Failed!\n");
+    free(rec_buffer);
+    return;
   } else {
     Serial.printf("Record %d bytes\n", sample_size);
   }
@@ -604,14 +918,48 @@ void record_wav() {
     (*(uint16_t *)(rec_buffer+i)) <<= VOLUME_GAIN;
   }
   
-  // Write data to the WAV file
-  Serial.printf("Writing to the file ...\n");
-  if (file.write(rec_buffer, record_size) != record_size)
-    Serial.printf("Write file Failed!\n");
+  // Now acquire SD mutex for writing
+  if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    // Use timestamp in filename if available
+    char filename[64];
+    if (timeInitialized) {
+      String timestamp = getTimestamp();
+      sprintf(filename, "/%s_%s_%06lu.wav", WAV_FILE_NAME, timestamp.c_str(), audioFileCount++);
+    } else {
+      sprintf(filename, "/%s_%06lu.wav", WAV_FILE_NAME, audioFileCount++);
+    }
+    
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+      Serial.println("Failed to open file for writing");
+      xSemaphoreGive(sdMutex);
+      free(rec_buffer);
+      return;
+    }
+    
+    // Write the header to the WAV file
+    uint8_t wav_header[WAV_HEADER_SIZE];
+    generate_wav_header(wav_header, record_size, SAMPLE_RATE);
+    file.write(wav_header, WAV_HEADER_SIZE);
+    
+    // Write data to the WAV file
+    Serial.printf("Writing to the file ...\n");
+    size_t written = file.write(rec_buffer, record_size);
+    file.close();
+    
+    // Release SD mutex
+    xSemaphoreGive(sdMutex);
+    
+    if (written != record_size) {
+      Serial.printf("Write file Failed! Wrote %d of %d bytes\n", written, record_size);
+    } else {
+      Serial.printf("Recording saved: %s\n", filename);
+    }
+  } else {
+    Serial.println("⚠️  Failed to acquire SD mutex for audio");
+  }
   
   free(rec_buffer);
-  file.close();
-  Serial.printf("Recording saved: %s\n", filename);
 }
 
 // Recording task for SD card mode with motion detection and auto-recording
@@ -963,9 +1311,9 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\n========================================");
-  Serial.println("XIAO ESP32S3 Camera & Audio Streamer v2.0");
-  Serial.println("Features: Motion Detection | Timestamps | File Cleanup");
-  Serial.println("          Power Management | OTA Updates | Status LED");
+  Serial.println("XIAO ESP32S3 Camera & Audio Streamer v3.0");
+  Serial.println("Features: BLE Control | Motion Detection | Timestamps");
+  Serial.println("          File Cleanup | Power Management | OTA Updates");
   Serial.println("========================================\n");
   
   // Initialize status LED
@@ -997,11 +1345,59 @@ void setup() {
     Serial.println("✓ Microphone initialized");
   }
   
-  // Connect to WiFi
+  // Initialize SD card (needed for both BLE and WiFi modes)
+  Serial.println("\nInitializing SD Card...");
+  if (!initSDCard()) {
+    Serial.println("❌ SD Card initialization failed!");
+    Serial.println("System halted - SD card required for recording.");
+    while (1) { 
+      updateStatusLED();
+      delay(1000);
+    }
+  }
+  
+  // Initialize BLE first (primary control method)
   Serial.println("\n========================================");
+  Serial.println("Starting in BLE CONTROL MODE");
+  Serial.println("========================================");
+  
+  if (!initBLE()) {
+    Serial.println("⚠️  BLE initialization failed!");
+  }
+  
+  Serial.println("\n📱 BLE Control Ready!");
+  Serial.println("========================================");
+  Serial.println("Connect via BLE app (nRF Connect, LightBlue, etc.)");
+  Serial.println("Device: ESP32-CAM-BLE");
+  Serial.println("\nCommands (write to Control characteristic):");
+  Serial.println("  START       - Start recording to SD card");
+  Serial.println("  STOP        - Stop recording");
+  Serial.println("  STATUS      - Get recording status");
+  Serial.println("  LIST_VIDEO  - List all video files");
+  Serial.println("  LIST_AUDIO  - List all audio files");
+  Serial.println("  LIST_ALL    - List all recorded files");
+  Serial.println("\nWiFi Mode (write to WiFi characteristic):");
+  Serial.println("  ENABLE_WIFI - Switch to WiFi streaming mode");
+  Serial.println("========================================\n");
+  
+  currentState = STATE_INIT;
+}
+
+void startWiFiMode() {
+  Serial.println("\n========================================");
+  Serial.println("Switching to WiFi Mode...");
+  Serial.println("========================================");
+  
+  // Disable BLE to free resources
+  if (bleEnabled) {
+    BLEDevice::deinit(true);
+    bleEnabled = false;
+    Serial.println("✓ BLE disabled");
+  }
+  
+  // Connect to WiFi
   Serial.println("Connecting to WiFi...");
   Serial.printf("SSID: %s\n", wifi_ssid);
-  Serial.println("========================================");
   
   currentState = STATE_WIFI_CONNECTING;
   WiFi.mode(WIFI_STA);
@@ -1018,38 +1414,12 @@ void setup() {
   
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\n❌ WiFi connection failed!");
-    Serial.println("========================================");
-    Serial.println("Switching to SD CARD RECORDING MODE");
-    Serial.println("========================================");
+    Serial.println("Returning to BLE mode...");
     
-    // Initialize SD card
-    if (!initSDCard()) {
-      Serial.println("❌ SD Card initialization failed!");
-      Serial.println("Cannot stream or record. System halted.");
-      while (1) { delay(1000); }
-    }
-    
-    // Enable recording mode
-    recordingMode = true;
-    
-    Serial.println("\n✓ Recording to SD Card");
-    Serial.println("========================================");
-    Serial.println("Video: /video/frame_XXXXXX.jpg");
-    Serial.println("Audio: /audio/audio_XXXXXX.wav");
-    Serial.println("========================================");
-    Serial.println("\nRecording started! Press RESET to stop.");
-    
-    // Start recording task on Core 0
-    xTaskCreatePinnedToCore(
-      recordingTask,   // Task function
-      "SDRecording",   // Task name
-      8192,            // Stack size (larger for SD operations)
-      NULL,            // Parameters
-      1,               // Priority
-      NULL,            // Task handle
-      0                // Core 0
-    );
-    
+    // Restart BLE
+    initBLE();
+    bleEnabled = true;
+    return;
   } else {
     // WiFi connected - start streaming mode
     currentState = STATE_WIFI_CONNECTED;
@@ -1123,9 +1493,42 @@ void loop() {
   // Update status LED
   updateStatusLED();
   
-  // Handle OTA updates
+  // Handle file listing requests (process in main loop to avoid stack overflow in BLE task)
+  if (listVideoRequested) {
+    listVideoRequested = false;
+    listVideoFiles();
+  }
+  if (listAudioRequested) {
+    listAudioRequested = false;
+    listAudioFiles();
+  }
+  if (listAllRequested) {
+    listAllRequested = false;
+    listAllFiles();
+  }
+  
+  // Handle WiFi mode request from BLE
+  if (wifiRequested && bleEnabled) {
+    wifiRequested = false;
+    startWiFiMode();
+  }
+  
+  // Handle OTA updates (only in WiFi mode)
   if (WiFi.status() == WL_CONNECTED) {
     ArduinoOTA.handle();
+  }
+  
+  // Update BLE status notifications
+  if (bleEnabled && deviceConnected && pStatusCharacteristic) {
+    static unsigned long lastBLEUpdate = 0;
+    if (millis() - lastBLEUpdate > 5000) {  // Every 5 seconds
+      String status = "Frames:" + String(frameCount) + 
+                     "|Audio:" + String(audioFileCount) + 
+                     "|Recording:" + String(bleRecordingActive ? "ON" : "OFF");
+      pStatusCharacteristic->setValue(status.c_str());
+      pStatusCharacteristic->notify();
+      lastBLEUpdate = millis();
+    }
   }
   
   // Check battery status
@@ -1147,13 +1550,16 @@ void loop() {
       uint64_t freeSpace = totalSpace - usedSpace;
       
       Serial.println("========================================");
-      Serial.printf("Recording Status:\n");
+      Serial.printf("Recording Status (%s):\n", bleEnabled ? "BLE" : "WiFi");
       Serial.printf("  Video frames: %lu\n", frameCount);
       Serial.printf("  Audio files: %lu\n", audioFileCount);
       Serial.printf("  Motion detected: %s\n", motionDetected ? "YES" : "NO");
       Serial.printf("  SD Free: %lluMB / %lluMB\n", freeSpace, totalSpace);
       Serial.printf("  Battery: %.2fV\n", getBatteryVoltage());
       Serial.printf("  Uptime: %lu seconds\n", millis() / 1000);
+      if (bleEnabled && deviceConnected) {
+        Serial.printf("  BLE: Connected\n");
+      }
       if (timeInitialized) {
         Serial.printf("  Time: %s\n", getTimestamp().c_str());
       }

@@ -49,6 +49,11 @@ bool bleRecordingActive = false;  // BLE-controlled recording state
 unsigned long frameCount = 0;
 unsigned long audioFileCount = 0;
 
+// Recording mode flags
+bool audioOnlyMode = false;   // Record only audio
+bool videoOnlyMode = false;   // Record only video (motion-triggered)
+bool bothMode = true;         // Record both audio and video (default)
+
 // File listing flags
 volatile bool listVideoRequested = false;
 volatile bool listAudioRequested = false;
@@ -58,12 +63,13 @@ volatile bool listAllRequested = false;
 SemaphoreHandle_t sdMutex = NULL;
 
 // ============================================
-// Motion Detection Configuration
+// Motion Detection Configuration (DISABLED)
 // ============================================
-#define MOTION_THRESHOLD 15      // Pixel difference threshold (0-255)
-#define MOTION_MIN_PIXELS 1000   // Minimum pixels changed to trigger motion
-bool motionDetected = false;
-camera_fb_t *lastFrame = NULL;
+// Motion detection temporarily disabled - using continuous recording
+// #define MOTION_THRESHOLD 15      // Pixel difference threshold (0-255)
+// #define MOTION_MIN_PIXELS 1000   // Minimum pixels changed to trigger motion
+// bool motionDetected = false;
+// camera_fb_t *lastFrame = NULL;
 
 // ============================================
 // Time & NTP Configuration
@@ -190,53 +196,18 @@ bool initCamera() {
 }
 
 // ============================================
-// MOTION DETECTION
+// MOTION DETECTION (DISABLED)
 // ============================================
+// Motion detection functions temporarily removed - using continuous recording
+/*
 bool detectMotion(camera_fb_t *currentFrame) {
-  if (!lastFrame || !currentFrame) return false;
-  
-  // Only compare if frames are same size and grayscale/small enough
-  if (lastFrame->len != currentFrame->len) {
-    return false;
-  }
-  
-  uint32_t changedPixels = 0;
-  uint32_t totalPixels = currentFrame->width * currentFrame->height;
-  
-  // Sample every 4th pixel for performance
-  for (uint32_t i = 0; i < currentFrame->len; i += 4) {
-    int diff = abs(currentFrame->buf[i] - lastFrame->buf[i]);
-    if (diff > MOTION_THRESHOLD) {
-      changedPixels++;
-    }
-  }
-  
-  // Check if enough pixels changed
-  bool motion = changedPixels > (MOTION_MIN_PIXELS / 4);
-  
-  if (motion) {
-    Serial.printf("Motion detected! %u pixels changed\n", changedPixels * 4);
-  }
-  
-  return motion;
+  // Motion detection code removed
 }
 
 void updateLastFrame(camera_fb_t *frame) {
-  if (lastFrame) {
-    free(lastFrame->buf);
-    free(lastFrame);
-  }
-  
-  // Allocate and copy frame for motion detection
-  lastFrame = (camera_fb_t*)malloc(sizeof(camera_fb_t));
-  if (lastFrame) {
-    memcpy(lastFrame, frame, sizeof(camera_fb_t));
-    lastFrame->buf = (uint8_t*)malloc(frame->len);
-    if (lastFrame->buf) {
-      memcpy(lastFrame->buf, frame->buf, frame->len);
-    }
-  }
+  // Motion detection code removed
 }
+*/
 
 // ============================================
 // TIME & TIMESTAMP FUNCTIONS
@@ -655,6 +626,39 @@ class ControlCallbacks: public BLECharacteristicCallbacks {
         listAllRequested = true;
         Serial.println("📋 All files list requested...");
       }
+      else if (command == "AUDIO_ONLY") {
+        audioOnlyMode = true;
+        videoOnlyMode = false;
+        bothMode = false;
+        Serial.println("🎙️  Mode: AUDIO ONLY");
+        
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue("Mode:AudioOnly");
+          pStatusCharacteristic->notify();
+        }
+      }
+      else if (command == "VIDEO_ONLY") {
+        audioOnlyMode = false;
+        videoOnlyMode = true;
+        bothMode = false;
+        Serial.println("📹 Mode: VIDEO ONLY");
+        
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue("Mode:VideoOnly");
+          pStatusCharacteristic->notify();
+        }
+      }
+      else if (command == "BOTH") {
+        audioOnlyMode = false;
+        videoOnlyMode = false;
+        bothMode = true;
+        Serial.println("🎥 Mode: AUDIO + VIDEO");
+        
+        if (pStatusCharacteristic) {
+          pStatusCharacteristic->setValue("Mode:Both");
+          pStatusCharacteristic->notify();
+        }
+      }
     }
   }
 };
@@ -962,18 +966,21 @@ void record_wav() {
   free(rec_buffer);
 }
 
-// Recording task for SD card mode with motion detection and auto-recording
+// Recording task for SD card mode with continuous recording
 void recordingTask(void *parameter) {
   Serial.println("Starting continuous SD card recording...");
-  Serial.println("Recording audio files automatically every 10 seconds");
+  
+  // Display recording mode
+  if (audioOnlyMode) {
+    Serial.println("Mode: AUDIO ONLY - Recording audio files every 10 seconds");
+  } else if (videoOnlyMode) {
+    Serial.println("Mode: VIDEO ONLY - Continuous video recording");
+  } else {
+    Serial.println("Mode: AUDIO + VIDEO - Recording both automatically");
+  }
   
   unsigned long lastFrameTime = 0;
-  unsigned long lastMotionCheck = 0;
   const unsigned long frameInterval = 100; // Capture frame every 100ms (10 FPS)
-  const unsigned long motionCheckInterval = 500; // Check motion every 500ms
-  bool isRecording = false;
-  unsigned long recordingStartTime = 0;
-  const unsigned long maxRecordingTime = 60000; // Stop recording after 60s of no motion
   
   currentState = STATE_RECORDING;
   
@@ -991,46 +998,26 @@ void recordingTask(void *parameter) {
       lastCleanupTime = millis();
     }
     
-    // Capture frame for motion detection
-    if (millis() - lastMotionCheck >= motionCheckInterval) {
+    // VIDEO RECORDING (only if not audio-only mode)
+    if (!audioOnlyMode && (millis() - lastFrameTime >= frameInterval)) {
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb) {
-        // Detect motion
-        if (detectMotion(fb)) {
-          motionDetected = true;
-          isRecording = true;
-          recordingStartTime = millis();
-          Serial.println("📹 Motion detected - recording started");
-        }
-        
-        // Update last frame for next comparison
-        updateLastFrame(fb);
-        
-        // Save frame if recording
-        if (isRecording) {
-          saveFrameToSD(fb);
-          lastActivityTime = millis();
-        }
-        
+        saveFrameToSD(fb);
         esp_camera_fb_return(fb);
-        lastMotionCheck = millis();
+        lastActivityTime = millis();
+        lastFrameTime = millis();
       }
     }
     
-    // Stop recording if no motion for maxRecordingTime
-    if (isRecording && (millis() - recordingStartTime > maxRecordingTime)) {
-      isRecording = false;
-      motionDetected = false;
-      Serial.println("⏸️  No motion - recording paused");
+    // AUDIO RECORDING (only if not video-only mode)
+    if (!videoOnlyMode) {
+      Serial.println("🎙️  Recording audio clip...");
+      record_wav();
+      lastActivityTime = millis();
     }
     
-    // Auto-record audio continuously (10 second clips)
-    Serial.println("🎙️  Recording audio clip...");
-    record_wav();
-    lastActivityTime = millis();
-    
-    // Small delay between recordings
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // Small delay to prevent watchdog
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
   
   Serial.println("Recording stopped");
@@ -1312,7 +1299,7 @@ void setup() {
   delay(1000);
   Serial.println("\n\n========================================");
   Serial.println("XIAO ESP32S3 Camera & Audio Streamer v3.0");
-  Serial.println("Features: BLE Control | Motion Detection | Timestamps");
+  Serial.println("Features: BLE Control | Continuous Recording | Timestamps");
   Serial.println("          File Cleanup | Power Management | OTA Updates");
   Serial.println("========================================\n");
   
@@ -1376,6 +1363,10 @@ void setup() {
   Serial.println("  LIST_VIDEO  - List all video files");
   Serial.println("  LIST_AUDIO  - List all audio files");
   Serial.println("  LIST_ALL    - List all recorded files");
+  Serial.println("\nRecording Modes:");
+  Serial.println("  AUDIO_ONLY  - Record only audio (no video)");
+  Serial.println("  VIDEO_ONLY  - Record only video (continuous)");
+  Serial.println("  BOTH        - Record both audio + video (default)");
   Serial.println("\nWiFi Mode (write to WiFi characteristic):");
   Serial.println("  ENABLE_WIFI - Switch to WiFi streaming mode");
   Serial.println("========================================\n");
@@ -1457,7 +1448,6 @@ void startWiFiMode() {
       json += "\"sdTotal\":" + String(SD.totalBytes() / (1024 * 1024)) + ",";
       json += "\"frames\":" + String(frameCount) + ",";
       json += "\"audioFiles\":" + String(audioFileCount) + ",";
-      json += "\"motionDetected\":" + String(motionDetected ? "true" : "false") + ",";
       json += "\"batteryVoltage\":" + String(getBatteryVoltage(), 2) + ",";
       json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
       json += "\"timestamp\":\"" + getTimestamp() + "\"";
@@ -1553,7 +1543,6 @@ void loop() {
       Serial.printf("Recording Status (%s):\n", bleEnabled ? "BLE" : "WiFi");
       Serial.printf("  Video frames: %lu\n", frameCount);
       Serial.printf("  Audio files: %lu\n", audioFileCount);
-      Serial.printf("  Motion detected: %s\n", motionDetected ? "YES" : "NO");
       Serial.printf("  SD Free: %lluMB / %lluMB\n", freeSpace, totalSpace);
       Serial.printf("  Battery: %.2fV\n", getBatteryVoltage());
       Serial.printf("  Uptime: %lu seconds\n", millis() / 1000);

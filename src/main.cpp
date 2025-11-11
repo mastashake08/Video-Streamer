@@ -11,7 +11,7 @@
 // ============================================
 // WiFi Credentials - CHANGE THESE!
 // ============================================
-const char* wifi_ssid = "mastawifi";      // Change to your WiFi name
+const char* wifi_ssid = "MastaWifi";      // Change to your WiFi name
 const char* wifi_password = "mastashake08";  // Change to your WiFi password
 
 // // OLED Display configuration (DISABLED - defective display)

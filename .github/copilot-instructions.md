@@ -41,6 +41,18 @@ pio device monitor
 pio run -t upload && pio device monitor
 ```
 
+### BLE Configuration Workflow
+On first boot or to change WiFi settings:
+1. Device starts in **BLE Configuration Mode** for 60 seconds
+2. BLE device name: **ESP32-CAM-Config**
+3. Connect via BLE app (nRF Connect, LightBlue, etc.)
+4. Write to characteristics:
+   - **SSID Characteristic**: Set desired WiFi hotspot name
+   - **Password Characteristic**: Set password (min 8 characters)
+5. Settings are saved to NVS (persistent across reboots)
+6. Device automatically exits BLE mode and starts WiFi AP
+7. If no BLE connection within 60s, uses saved/default credentials
+
 ### Project Structure
 - `src/main.cpp` - Main application entry point (setup() and loop())
 - `include/` - Header files for the project
@@ -98,6 +110,12 @@ XIAO ESP32S3 with camera expansion board uses these pins:
 - GPIO 7 (D8): MicroSD SPI SCK
 - GPIO 8 (D9): MicroSD SPI MISO
 - GPIO 9 (D10): MicroSD SPI MOSI
+
+**OLED Display (0.96" I2C SSD1306):**
+- GPIO 5 (D4): SDA (I2C Data)
+- GPIO 6 (D5): SCL (I2C Clock)
+- 3.3V: VCC
+- GND: GND
 
 Example camera initialization:
 ```cpp
@@ -158,8 +176,16 @@ void setup() {
 }
 ```
 
+### BLE Service UUIDs (for custom apps)
+- **Service UUID**: `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
+- **SSID Characteristic**: `beb5483e-36e1-4688-b7f5-ea07361b26a8` (Read/Write)
+- **Password Characteristic**: `1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e` (Write only)
+- **Status Characteristic**: `d8de624e-140f-4a23-8b85-726f9d55da18` (Read/Notify)
+
 ### Troubleshooting
 - If upload fails: Hold BOOT button while connecting USB, or add `upload_speed = 115200` to platformio.ini
 - Camera initialization errors: Verify pin configuration matches your board/expansion
 - Out of memory: Enable PSRAM in board configuration
 - Slow performance: Use dual-core RTOS tasks for parallel processing
+- BLE not visible: Wait for "BLE Server started" message in serial monitor, ensure device is within Bluetooth range
+- WiFi credentials not saving: Check NVS partition in platformio.ini (default partition scheme includes NVS)

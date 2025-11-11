@@ -13,6 +13,10 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "USB.h"
+#include "USBMSC.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
 // #include <Wire.h>
 // #include <Adafruit_GFX.h>
 // #include <Adafruit_SSD1306.h>
@@ -21,6 +25,13 @@
 
 // I2S instance for PDM microphone
 I2SClass I2S;
+
+// USB Mass Storage instance
+USBMSC msc;
+
+// USB MSC state
+bool usbMscEnabled = false;
+bool usbMscMounted = false;
 
 // Camera sensor PID definitions
 #define OV3660_PID 0x3660
@@ -149,6 +160,231 @@ AsyncWebSocket ws("/audio");
 #define VOLUME_GAIN 2
 #define RECORD_TIME 10  // seconds per file
 #define WAV_FILE_NAME "recording"
+
+// ============================================
+// USB MASS STORAGE CALLBACKS
+// ============================================
+// Virtual disk buffer for USB MSC (PSRAM-backed RAM disk for file transfer)
+// Disk size is chosen at runtime based on available PSRAM. Sector size is fixed at 512.
+static uint32_t disk_sector_count = 0; // set when RAM disk is allocated
+static const uint32_t disk_sector_size = 512;
+static uint8_t* msc_disk = nullptr;
+
+// Read callback - reads 512-byte sectors from virtual disk
+static int32_t onRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+  if (!usbMscMounted || !msc_disk || disk_sector_count == 0) {
+    return 0;
+  }
+
+  // Check bounds
+  if (lba >= disk_sector_count) {
+    return 0;
+  }
+
+  // Copy from virtual disk to buffer
+  uint8_t* addr = msc_disk + (uint32_t)lba * disk_sector_size + offset;
+  memcpy(buffer, addr, bufsize);
+
+  return (int32_t)bufsize;
+}
+
+// Write callback - writes 512-byte sectors to virtual disk
+static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+  if (!usbMscMounted || !msc_disk || disk_sector_count == 0) {
+    return 0;
+  }
+
+  // Check bounds
+  if (lba >= disk_sector_count) {
+    return 0;
+  }
+
+  // Copy from buffer to virtual disk
+  uint8_t* addr = msc_disk + (uint32_t)lba * disk_sector_size + offset;
+  memcpy(addr, buffer, bufsize);
+
+  return (int32_t)bufsize;
+}
+
+// Start/Stop callback - called when host mounts/unmounts the device
+static bool onStartStop(uint8_t power_condition, bool start, bool load_eject) {
+  Serial.printf("USB MSC: %s\n", start ? "Mounted" : "Unmounted");
+  usbMscMounted = start;
+  
+  if (start) {
+    // Stop recording when USB MSC is mounted to prevent file system conflicts
+    if (recordingMode) {
+      Serial.println("⚠️  Stopping recording - USB MSC mounted");
+      bleRecordingActive = false;
+      recordingMode = false;
+    }
+  }
+  
+  return true;
+}
+
+// Initialize USB Mass Storage
+bool initUSBMSC() {
+  if (usbMscEnabled) {
+    Serial.println("USB MSC already enabled");
+    return true;
+  }
+  
+  Serial.println("Initializing USB Mass Storage...");
+  Serial.println("========================================");
+  
+  // Report PSRAM status before allocation
+  if (psramFound()) {
+    uint32_t psramTotal = ESP.getPsramSize();
+    uint32_t psramFree = ESP.getFreePsram();
+    uint32_t psramUsed = psramTotal - psramFree;
+    Serial.printf("PSRAM Status BEFORE allocation:\n");
+    Serial.printf("  Total: %u KB (%u bytes)\n", psramTotal / 1024, psramTotal);
+    Serial.printf("  Used:  %u KB (%u bytes)\n", psramUsed / 1024, psramUsed);
+    Serial.printf("  Free:  %u KB (%u bytes)\n", psramFree / 1024, psramFree);
+    Serial.println("----------------------------------------");
+  } else {
+    Serial.println("❌ PSRAM not found - USB MSC requires PSRAM!");
+    return false;
+  }
+  
+  // Allocate RAM disk in PSRAM (try progressively smaller sizes)
+  if (!msc_disk) {
+    const uint32_t candidates[] = {
+      16UL * 1024UL * 1024UL, // 16 MB
+      8UL  * 1024UL * 1024UL, // 8 MB
+      4UL  * 1024UL * 1024UL, // 4 MB
+      2UL  * 1024UL * 1024UL, // 2 MB
+      1UL  * 1024UL * 1024UL, // 1 MB
+      512UL * 1024UL,         // 512 KB
+      256UL * 1024UL          // 256 KB (minimum)
+    };
+    const size_t nc = sizeof(candidates) / sizeof(candidates[0]);
+
+    Serial.println("Attempting progressive RAM disk allocation...");
+    for (size_t i = 0; i < nc; ++i) {
+      uint32_t bytes = candidates[i];
+      uint32_t sectors = bytes / disk_sector_size;
+      Serial.printf("[%d/%d] Trying %u KB...", (int)(i+1), (int)nc, bytes / 1024UL);
+      
+      msc_disk = (uint8_t*)ps_malloc(bytes);
+      if (msc_disk) {
+        disk_sector_count = sectors;
+        memset(msc_disk, 0, bytes);
+        Serial.printf(" ✓ SUCCESS\n");
+        Serial.println("----------------------------------------");
+        Serial.printf("✓ RAM disk allocated: %u KB\n", bytes / 1024UL);
+        Serial.printf("  Sectors: %u x %u bytes\n", disk_sector_count, disk_sector_size);
+        
+        // Report PSRAM status after allocation
+        uint32_t psramFreeAfter = ESP.getFreePsram();
+        uint32_t psramUsedAfter = ESP.getPsramSize() - psramFreeAfter;
+        Serial.println("----------------------------------------");
+        Serial.printf("PSRAM Status AFTER allocation:\n");
+        Serial.printf("  Used:  %u KB (%u bytes)\n", psramUsedAfter / 1024, psramUsedAfter);
+        Serial.printf("  Free:  %u KB (%u bytes)\n", psramFreeAfter / 1024, psramFreeAfter);
+        Serial.printf("  Delta: +%u KB allocated\n", bytes / 1024UL);
+        
+        // Send status via BLE if connected
+        if (deviceConnected && pStatusCharacteristic) {
+          String status = "USB:Enabled|RAMDisk:" + String(bytes / 1024) + "KB";
+          pStatusCharacteristic->setValue(status.c_str());
+          pStatusCharacteristic->notify();
+        }
+        
+        break;
+      } else {
+        Serial.printf(" ❌ FAILED\n");
+      }
+    }
+
+    if (!msc_disk) {
+      Serial.println("========================================");
+      Serial.println("❌ Failed to allocate any RAM disk size");
+      Serial.println("Not enough PSRAM available!");
+      Serial.println("----------------------------------------");
+      Serial.println("💡 Recommendation: Use Web File Browser instead");
+      Serial.println("   Access files via WiFi at http://<IP>/files");
+      Serial.println("   No PSRAM required, unlimited file size support");
+      Serial.println("========================================");
+      
+      // Send failure notification via BLE
+      if (deviceConnected && pStatusCharacteristic) {
+        pStatusCharacteristic->setValue("USB:Failed|UseBrowser");
+        pStatusCharacteristic->notify();
+      }
+      
+      return false;
+    }
+  }
+  
+  // Configure MSC device
+  msc.vendorID("Seeed");
+  msc.productID("XIAO ESP32S3");
+  msc.productRevision("1.0");
+  msc.onRead(onRead);
+  msc.onWrite(onWrite);
+  msc.onStartStop(onStartStop);
+  msc.mediaPresent(true);
+  
+  if (!msc.begin(disk_sector_count, disk_sector_size)) {
+    Serial.println("❌ Failed to start USB MSC");
+    return false;
+  }
+
+  USB.begin();
+
+  usbMscEnabled = true;
+  Serial.println("✓ USB Mass Storage enabled");
+  Serial.printf("  %u KB RAM disk exposed as USB drive\n", (disk_sector_count * disk_sector_size) / 1024U);
+  Serial.println("  ⚠️  This is a virtual disk for file transfers");
+  Serial.println("  ⚠️  Format as FAT32 first, then copy files to/from SD card manually");
+  Serial.println("  Safely eject the drive before sending DISABLE_USB command");
+  
+  return true;
+}
+
+// Disable USB Mass Storage
+void disableUSBMSC() {
+  if (!usbMscEnabled) {
+    return;
+  }
+  
+  Serial.println("Disabling USB Mass Storage...");
+  
+  // Wait for unmount
+  if (usbMscMounted) {
+    Serial.println("⚠️  Please eject the USB drive from your computer first!");
+    Serial.println("Waiting for unmount...");
+    
+    unsigned long timeout = millis() + 30000; // 30 second timeout
+    while (usbMscMounted && millis() < timeout) {
+      delay(100);
+    }
+    
+    if (usbMscMounted) {
+      Serial.println("⚠️  Timeout - force disabling USB MSC");
+    }
+  }
+  
+  msc.end();
+  // Note: USB.end() not available - USB peripheral stays active
+  
+  // Free RAM disk (optional - keep it allocated for next time)
+  // if (msc_disk) {
+  //   free(msc_disk);
+  //   msc_disk = nullptr;
+  // }
+  
+  usbMscEnabled = false;
+  usbMscMounted = false;
+  
+  Serial.println("✓ USB Mass Storage disabled");
+  Serial.println("  Recording can now be resumed");
+  
+  // Small delay
+  delay(500);
+}
 
 // Initialize camera - following official XIAO ESP32S3 example pattern
 bool initCamera() {
@@ -684,6 +920,37 @@ class ControlCallbacks: public BLECharacteristicCallbacks {
           pStatusCharacteristic->notify();
         }
       }
+      else if (command == "ENABLE_USB") {
+        if (!usbMscEnabled) {
+          if (initUSBMSC()) {
+            if (pStatusCharacteristic) {
+              pStatusCharacteristic->setValue("USB:Enabled");
+              pStatusCharacteristic->notify();
+            }
+            Serial.println("💾 USB Mass Storage ENABLED");
+            Serial.println("   Connect USB cable to access SD card files");
+          } else {
+            if (pStatusCharacteristic) {
+              pStatusCharacteristic->setValue("USB:Failed");
+              pStatusCharacteristic->notify();
+            }
+          }
+        } else {
+          Serial.println("⚠️  USB MSC already enabled");
+        }
+      }
+      else if (command == "DISABLE_USB") {
+        if (usbMscEnabled) {
+          disableUSBMSC();
+          if (pStatusCharacteristic) {
+            pStatusCharacteristic->setValue("USB:Disabled");
+            pStatusCharacteristic->notify();
+          }
+          Serial.println("💾 USB Mass Storage DISABLED");
+        } else {
+          Serial.println("⚠️  USB MSC not enabled");
+        }
+      }
     }
   }
 };
@@ -1006,6 +1273,16 @@ void record_wav() {
 
 // Recording task for SD card mode with continuous recording
 void recordingTask(void *parameter) {
+  // Check if USB MSC is active
+  if (usbMscEnabled) {
+    Serial.println("❌ Cannot start recording - USB Mass Storage is active");
+    Serial.println("   Send DISABLE_USB command first");
+    recordingMode = false;
+    bleRecordingActive = false;
+    vTaskDelete(NULL);
+    return;
+  }
+  
   Serial.println("Starting 10-second interval recording...");
   Serial.println("========================================");
   
@@ -1025,7 +1302,7 @@ void recordingTask(void *parameter) {
   
   currentState = STATE_RECORDING;
   
-  while (recordingMode) {
+  while (recordingMode && !usbMscEnabled) {
     unsigned long currentTime = millis();
     
     // Check battery status periodically
@@ -1457,6 +1734,9 @@ void setup() {
   Serial.println("  AUDIO_ONLY  - Record only audio (no video)");
   Serial.println("  VIDEO_ONLY  - Record only video (continuous)");
   Serial.println("  BOTH        - Record both audio + video (default)");
+  Serial.println("\nUSB Mass Storage:");
+  Serial.println("  ENABLE_USB  - Enable USB drive mode (access SD card)");
+  Serial.println("  DISABLE_USB - Disable USB drive mode");
   Serial.println("\nWiFi Mode (write to WiFi characteristic):");
   Serial.println("  ENABLE_WIFI - Switch to WiFi streaming mode");
   Serial.println("========================================\n");
@@ -1545,6 +1825,272 @@ void startWiFiMode() {
       request->send(200, "application/json", json);
     });
     
+    // File browser API endpoints - list files in directory
+    server.on("/api/files/list", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String path = "/";
+      if (request->hasParam("path")) {
+        path = request->getParam("path")->value();
+      }
+      
+      if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File dir = SD.open(path);
+        if (!dir || !dir.isDirectory()) {
+          xSemaphoreGive(sdMutex);
+          request->send(404, "application/json", "{\"error\":\"Directory not found\"}");
+          return;
+        }
+        
+        String json = "{\"path\":\"" + path + "\",\"files\":[";
+        bool first = true;
+        File file = dir.openNextFile();
+        while (file) {
+          if (!first) json += ",";
+          first = false;
+          json += "{\"name\":\"" + String(file.name()) + "\",";
+          json += "\"size\":" + String(file.size()) + ",";
+          json += "\"isDir\":" + String(file.isDirectory() ? "true" : "false") + "}";
+          file = dir.openNextFile();
+        }
+        json += "]}";
+        dir.close();
+        xSemaphoreGive(sdMutex);
+        
+        request->send(200, "application/json", json);
+      } else {
+        request->send(503, "application/json", "{\"error\":\"SD card busy\"}");
+      }
+    });
+    
+    // Download file endpoint
+    server.on("/api/files/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (!request->hasParam("path")) {
+        request->send(400, "application/json", "{\"error\":\"Missing path parameter\"}");
+        return;
+      }
+      
+      String filePath = request->getParam("path")->value();
+      
+      if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SD.open(filePath);
+        if (!file || file.isDirectory()) {
+          xSemaphoreGive(sdMutex);
+          request->send(404, "application/json", "{\"error\":\"File not found\"}");
+          return;
+        }
+        
+        // Stream file to client
+        AsyncWebServerResponse *response = request->beginResponse(
+          "application/octet-stream",
+          file.size(),
+          [file](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+            return file.read(buffer, maxLen);
+          }
+        );
+        
+        // Extract filename for download
+        String filename = filePath;
+        int lastSlash = filename.lastIndexOf('/');
+        if (lastSlash >= 0) {
+          filename = filename.substring(lastSlash + 1);
+        }
+        response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        
+        request->send(response);
+        file.close();
+        xSemaphoreGive(sdMutex);
+      } else {
+        request->send(503, "application/json", "{\"error\":\"SD card busy\"}");
+      }
+    });
+    
+    // Delete file endpoint
+    server.on("/api/files/delete", HTTP_DELETE, [](AsyncWebServerRequest *request) {
+      if (!request->hasParam("path")) {
+        request->send(400, "application/json", "{\"error\":\"Missing path parameter\"}");
+        return;
+      }
+      
+      String filePath = request->getParam("path")->value();
+      
+      if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (SD.remove(filePath)) {
+          xSemaphoreGive(sdMutex);
+          request->send(200, "application/json", "{\"success\":true}");
+        } else {
+          xSemaphoreGive(sdMutex);
+          request->send(500, "application/json", "{\"error\":\"Failed to delete file\"}");
+        }
+      } else {
+        request->send(503, "application/json", "{\"error\":\"SD card busy\"}");
+      }
+    });
+    
+    // File browser web UI
+    server.on("/files", HTTP_GET, [](AsyncWebServerRequest *request) {
+      const char* fileBrowserHtml = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32-CAM File Browser</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #1a1a1a;
+      color: white;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 { margin-bottom: 10px; }
+    .path { color: #888; font-size: 14px; margin-bottom: 20px; }
+    .file-list {
+      background-color: #2a2a2a;
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .file-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px;
+      border-bottom: 1px solid #444;
+      cursor: pointer;
+    }
+    .file-item:hover { background-color: #333; }
+    .file-name { flex-grow: 1; }
+    .file-size { color: #888; margin-right: 10px; font-size: 14px; }
+    .folder { color: #4CAF50; }
+    .file { color: #2196F3; }
+    button {
+      padding: 8px 16px;
+      margin: 5px;
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button.delete { background-color: #f44336; }
+    button:hover { opacity: 0.8; }
+    .loading { text-align: center; padding: 20px; color: #888; }
+    .error { color: #f44336; padding: 20px; }
+    .actions { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>📁 File Browser</h1>
+  <div class="path" id="currentPath">/</div>
+  <button onclick="location.href='/'">🏠 Home</button>
+  <button onclick="refreshFiles()">🔄 Refresh</button>
+  <div class="file-list" id="fileList">
+    <div class="loading">Loading...</div>
+  </div>
+  
+  <script>
+    let currentPath = '/';
+    
+    async function loadFiles(path = '/') {
+      currentPath = path;
+      document.getElementById('currentPath').textContent = 'Path: ' + path;
+      document.getElementById('fileList').innerHTML = '<div class="loading">Loading...</div>';
+      
+      try {
+        const response = await fetch('/api/files/list?path=' + encodeURIComponent(path));
+        const data = await response.json();
+        
+        if (data.error) {
+          document.getElementById('fileList').innerHTML = '<div class="error">Error: ' + data.error + '</div>';
+          return;
+        }
+        
+        let html = '';
+        
+        // Add parent directory link if not at root
+        if (path !== '/') {
+          const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+          html += '<div class="file-item folder" onclick="loadFiles(\'' + parentPath + '\')">';
+          html += '<span class="file-name">📁 ..</span>';
+          html += '</div>';
+        }
+        
+        // Sort: directories first, then files
+        data.files.sort((a, b) => {
+          if (a.isDir && !b.isDir) return -1;
+          if (!a.isDir && b.isDir) return 1;
+          return a.name.localeCompare(b.name);
+        });
+        
+        data.files.forEach(file => {
+          const fullPath = path === '/' ? '/' + file.name : path + '/' + file.name;
+          const icon = file.isDir ? '📁' : '📄';
+          const cssClass = file.isDir ? 'folder' : 'file';
+          const sizeText = file.isDir ? '' : formatSize(file.size);
+          
+          html += '<div class="file-item ' + cssClass + '">';
+          if (file.isDir) {
+            html += '<span class="file-name" onclick="loadFiles(\'' + fullPath + '\')">' + icon + ' ' + file.name + '</span>';
+          } else {
+            html += '<span class="file-name">' + icon + ' ' + file.name + '</span>';
+            html += '<span class="file-size">' + sizeText + '</span>';
+            html += '<button onclick="downloadFile(\'' + fullPath + '\')">⬇️ Download</button>';
+            html += '<button class="delete" onclick="deleteFile(\'' + fullPath + '\')">🗑️ Delete</button>';
+          }
+          html += '</div>';
+        });
+        
+        if (data.files.length === 0) {
+          html = '<div class="loading">Empty directory</div>';
+        }
+        
+        document.getElementById('fileList').innerHTML = html;
+      } catch (error) {
+        document.getElementById('fileList').innerHTML = '<div class="error">Error loading files: ' + error.message + '</div>';
+      }
+    }
+    
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+    
+    function downloadFile(path) {
+      window.location.href = '/api/files/download?path=' + encodeURIComponent(path);
+    }
+    
+    async function deleteFile(path) {
+      if (!confirm('Delete ' + path + '?')) return;
+      
+      try {
+        const response = await fetch('/api/files/delete?path=' + encodeURIComponent(path), {
+          method: 'DELETE'
+        });
+        const data = await response.json();
+        
+        if (data.success) {
+          alert('File deleted successfully');
+          refreshFiles();
+        } else {
+          alert('Error: ' + (data.error || 'Failed to delete'));
+        }
+      } catch (error) {
+        alert('Error: ' + error.message);
+      }
+    }
+    
+    function refreshFiles() {
+      loadFiles(currentPath);
+    }
+    
+    // Load root directory on page load
+    loadFiles('/');
+  </script>
+</body>
+</html>
+)rawliteral";
+      request->send(200, "text/html", fileBrowserHtml);
+    });
+    
     // Start server
     server.begin();
     Serial.println("\n✓ Web server started");
@@ -1566,6 +2112,7 @@ void startWiFiMode() {
     Serial.println("\nReady to stream video & audio!");
     Serial.println("Click 'Enable Audio' button in browser to start audio");
     Serial.println("\n📊 Status API: http://" + IP.toString() + "/api/status");
+    Serial.println("📁 File Browser: http://" + IP.toString() + "/files");
   }
 }
 
@@ -1616,6 +2163,13 @@ void loop() {
   if (millis() - lastBatteryCheck > 60000) {  // Check every minute
     checkBatteryStatus();
     lastBatteryCheck = millis();
+  }
+  
+  // Stop recording if USB MSC becomes active
+  if (usbMscEnabled && recordingMode) {
+    Serial.println("⚠️  USB MSC enabled - stopping recording");
+    bleRecordingActive = false;
+    recordingMode = false;
   }
   
   // Check idle timeout for power saving

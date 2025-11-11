@@ -166,11 +166,11 @@ camera_config_t camera_config = {
   .ledc_timer = LEDC_TIMER_0,
   .ledc_channel = LEDC_CHANNEL_0,
   .pixel_format = PIXFORMAT_JPEG,
-  .frame_size = FRAMESIZE_SVGA,  // 800x600
-  .jpeg_quality = 12,
-  .fb_count = 1,
+  .frame_size = FRAMESIZE_VGA,  // 640x480 (smaller, should work with PSRAM)
+  .jpeg_quality = 10,
+  .fb_count = 2,
   .fb_location = CAMERA_FB_IN_PSRAM,
-  .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+  .grab_mode = CAMERA_GRAB_LATEST
 };
 // Initialize camera
 bool initCamera() {
@@ -1331,6 +1331,18 @@ void setup() {
   Serial.println("          File Cleanup | Power Management | OTA Updates");
   Serial.println("========================================\n");
   
+  // Check PSRAM availability first
+  Serial.println("Checking PSRAM...");
+  if (psramFound()) {
+    Serial.printf("✓ PSRAM found: %d bytes total, %d bytes free\n", 
+                  ESP.getPsramSize(), ESP.getFreePsram());
+  } else {
+    Serial.println("❌ PSRAM not found!");
+    Serial.println("Camera initialization will fail without PSRAM!");
+    Serial.println("Check platformio.ini board_build.arduino.memory_type setting");
+    while (1) { delay(1000); }
+  }
+  
   // Initialize status LED
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -1339,7 +1351,7 @@ void setup() {
   lastActivityTime = millis();
   
   // Initialize camera
-  Serial.println("Initializing camera...");
+  Serial.println("\nInitializing camera...");
   if (!initCamera()) {
     Serial.println("❌ Camera initialization failed!");
     currentState = STATE_ERROR;

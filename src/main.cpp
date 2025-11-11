@@ -2,7 +2,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
-#include <I2S.h>
+#include <ESP_I2S.h>
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
@@ -18,6 +18,9 @@
 // #include <Adafruit_SSD1306.h>
 #include "esp_camera.h"
 #include "esp_sleep.h"
+
+// I2S instance for PDM microphone
+I2SClass I2S;
 
 // Camera sensor PID definitions
 #define OV3660_PID 0x3660
@@ -763,13 +766,13 @@ bool initBLE() {
   return true;
 }
 
-// Initialize PDM microphone (using I2S library per Seeed example)
+// Initialize PDM microphone (using ESP_I2S 3.0 library)
 bool initMicrophone() {
-  // Configure pins: bck=-1, ws=42 (CLK), data_in=41 (DATA), data_out=-1, mck=-1
-  I2S.setAllPins(-1, PDM_CLK_PIN, PDM_DATA_PIN, -1, -1);
+  // Setup PDM pins: clock=42, data=41
+  I2S.setPinsPdmRx(PDM_CLK_PIN, PDM_DATA_PIN);
   
-  // Begin in PDM mono mode with 16kHz sample rate and 16-bit samples
-  if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
+  // Start I2S in PDM RX mode at 16 kHz with 16-bit samples, mono
+  if (!I2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println("Failed to initialize I2S!");
     return false;
   }
@@ -933,7 +936,16 @@ void record_wav() {
   Serial.printf("Buffer: %d bytes\n", ESP.getPsramSize() - ESP.getFreePsram());
   
   // Start recording - read from I2S (do this BEFORE acquiring SD mutex to avoid blocking)
-  sample_size = I2S.read(rec_buffer, record_size);
+  uint32_t bytes_read = 0;
+  while (bytes_read < record_size) {
+    int sample = I2S.read();
+    if (sample != -1 && sample != 0 && sample != 1) {
+      // Store sample as 16-bit value
+      rec_buffer[bytes_read++] = sample & 0xFF;
+      rec_buffer[bytes_read++] = (sample >> 8) & 0xFF;
+    }
+  }
+  sample_size = bytes_read;
   
   if (sample_size == 0) {
     Serial.printf("Record Failed!\n");
@@ -1143,12 +1155,19 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 
 // Audio streaming task
 void audioTask(void *parameter) {
-  const size_t bufferSize = 512;
-  uint8_t audioBuffer[bufferSize];
+  const size_t bufferSize = 256; // 256 samples = 512 bytes
+  uint8_t audioBuffer[bufferSize * 2];
   
   while (true) {
     // Read audio data from I2S/PDM microphone
-    size_t bytesRead = I2S.read(audioBuffer, bufferSize);
+    size_t bytesRead = 0;
+    for (size_t i = 0; i < bufferSize && bytesRead < bufferSize * 2; i++) {
+      int sample = I2S.read();
+      if (sample != -1 && sample != 0 && sample != 1) {
+        audioBuffer[bytesRead++] = sample & 0xFF;
+        audioBuffer[bytesRead++] = (sample >> 8) & 0xFF;
+      }
+    }
     
     if (bytesRead > 0 && ws.count() > 0) {
       // Send audio data to all connected WebSocket clients

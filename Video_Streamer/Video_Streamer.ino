@@ -557,10 +557,10 @@ class ServerCallbacks: public BLEServerCallbacks {
 
 class ControlCallbacks: public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
-    std::string value = pCharacteristic->getValue();
+    String value = pCharacteristic->getValue().c_str();
     
     if (value.length() > 0) {
-      String command = String(value.c_str());
+      String command = value;
       command.trim();
       Serial.println("BLE Command: " + command);
       
@@ -638,10 +638,10 @@ class ControlCallbacks: public BLECharacteristicCallbacks {
 
 class WiFiCallbacks: public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
-    std::string value = pCharacteristic->getValue();
+    String value = pCharacteristic->getValue().c_str();
     
     if (value.length() > 0) {
-      String command = String(value.c_str());
+      String command = value;
       command.trim();
       
       if (command == "ENABLE_WIFI") {

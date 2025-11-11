@@ -557,25 +557,27 @@ bool saveFrameToSD(camera_fb_t *fb) {
 
 // Generate WAV file header (per Seeed documentation format)
 void generateWavHeader(uint8_t *wav_header, uint32_t wav_size, uint32_t sample_rate) {
-  uint32_t file_size = wav_size + 44 - 8;
+  uint32_t file_size = wav_size + 36;
   uint32_t byte_rate = sample_rate * SAMPLE_BITS / 8;
   
-  const uint8_t set_wav_header[] = {
-    'R','I','F','F', // ChunkID
-    file_size, file_size >> 8, file_size >> 16, file_size >> 24, // ChunkSize
-    'W','A','V','E', // Format
-    'f','m','t',' ', // Subchunk1ID
-    0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
-    0x01, 0x00, // AudioFormat (1 for PCM)
-    0x01, 0x00, // NumChannels (1 channel)
-    sample_rate, sample_rate >> 8, sample_rate >> 16, sample_rate >> 24, // SampleRate
-    byte_rate, byte_rate >> 8, byte_rate >> 16, byte_rate >> 24, // ByteRate
-    0x02, 0x00, // BlockAlign
-    0x10, 0x00, // BitsPerSample (16 bits)
-    'd','a','t','a', // Subchunk2ID
-    wav_size, wav_size >> 8, wav_size >> 16, wav_size >> 24, // Subchunk2Size
-  };
-  memcpy(wav_header, set_wav_header, sizeof(set_wav_header));
+  // Build header manually to avoid narrowing warnings
+  wav_header[0] = 'R'; wav_header[1] = 'I'; wav_header[2] = 'F'; wav_header[3] = 'F';
+  wav_header[4] = file_size & 0xFF; wav_header[5] = (file_size >> 8) & 0xFF;
+  wav_header[6] = (file_size >> 16) & 0xFF; wav_header[7] = (file_size >> 24) & 0xFF;
+  wav_header[8] = 'W'; wav_header[9] = 'A'; wav_header[10] = 'V'; wav_header[11] = 'E';
+  wav_header[12] = 'f'; wav_header[13] = 'm'; wav_header[14] = 't'; wav_header[15] = ' ';
+  wav_header[16] = 0x10; wav_header[17] = 0x00; wav_header[18] = 0x00; wav_header[19] = 0x00;
+  wav_header[20] = 0x01; wav_header[21] = 0x00;
+  wav_header[22] = 0x01; wav_header[23] = 0x00;
+  wav_header[24] = sample_rate & 0xFF; wav_header[25] = (sample_rate >> 8) & 0xFF;
+  wav_header[26] = (sample_rate >> 16) & 0xFF; wav_header[27] = (sample_rate >> 24) & 0xFF;
+  wav_header[28] = byte_rate & 0xFF; wav_header[29] = (byte_rate >> 8) & 0xFF;
+  wav_header[30] = (byte_rate >> 16) & 0xFF; wav_header[31] = (byte_rate >> 24) & 0xFF;
+  wav_header[32] = 0x02; wav_header[33] = 0x00;
+  wav_header[34] = 0x10; wav_header[35] = 0x00;
+  wav_header[36] = 'd'; wav_header[37] = 'a'; wav_header[38] = 't'; wav_header[39] = 'a';
+  wav_header[40] = wav_size & 0xFF; wav_header[41] = (wav_size >> 8) & 0xFF;
+  wav_header[42] = (wav_size >> 16) & 0xFF; wav_header[43] = (wav_size >> 24) & 0xFF;
 }
 
 // Save audio buffer to SD card with timestamp (based on Seeed recording example)
